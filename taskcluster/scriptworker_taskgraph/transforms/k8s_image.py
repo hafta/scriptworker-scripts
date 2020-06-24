@@ -78,8 +78,9 @@ def set_environment(config, jobs):
                 "DOCKERHUB_USER": config.graph_config["docker"]["user"],
             })
             scopes.append('secrets:get:project/releng/scriptworker-scripts/deploy')
-            if push_docker_image == "force":
-                attributes.setdefault("digest-extra", {}).setdefault("force_run", time.time())
+            # Don't cache this task; always run if push_docker_image
+            attributes.pop('cached_task', None)
+            job.pop('cache', None)
         else:
             env["PUSH_DOCKER_IMAGE"] = "0"
         yield job

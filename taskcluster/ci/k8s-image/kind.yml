@@ -9,8 +9,8 @@ kind-dependencies:
 
 transforms:
     - scriptworker_taskgraph.transforms.python_version:transforms
-    - scriptworker_taskgraph.transforms.k8s_image:transforms
     - scriptworker_taskgraph.transforms.cached:transforms
+    - scriptworker_taskgraph.transforms.k8s_image:transforms
     - taskgraph.transforms.cached_tasks:transforms
     - taskgraph.transforms.task:transforms
 

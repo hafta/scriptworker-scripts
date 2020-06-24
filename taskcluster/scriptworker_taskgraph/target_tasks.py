@@ -16,4 +16,5 @@ def target_tasks_default(full_task_graph, parameters, graph_config):
             return False
         if parameters.get("script_name"):
             return task.attributes.get("script-name") == parameters["script_name"]
+        return True
     return [l for l, t in full_task_graph.tasks.iteritems() if filter(t, parameters)]
