@@ -15,6 +15,8 @@ from shutil import copy2
 import arrow
 import attr
 import pexpect
+import tempfile
+import zipfile
 
 from iscript.autograph import sign_langpacks, sign_omnija_with_autograph, sign_widevine_dir
 from iscript.exceptions import InvalidNotarization, IScriptError, ThrottledNotarization, TimeoutError, UnknownAppDir, UnknownNotarizationError
@@ -22,6 +24,8 @@ from iscript.util import get_key_config
 from scriptworker_client.aio import download_file, raise_future_exceptions, retry_async, semaphore_wrapper
 from scriptworker_client.exceptions import DownloadError
 from scriptworker_client.utils import get_artifact_path, makedirs, rm, run_command
+
+from iscript.codesigntree import codesigntree
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +111,10 @@ def _get_pkg_name_from_tarball(path):
             return path.replace(ext, ".pkg")
     raise IScriptError("Unknown tarball suffix in path {}".format(path))
 
+# is_macapp_entitlements {{{1
+def is_macapp_entitlements(app):
+    """Returns true if the app is an entitlements archive and not a build to sign"""
+    return ("macapp_entitlements" in app.formats)
 
 # set_app_path_and_name {{{1
 def set_app_path_and_name(app):
@@ -443,6 +451,8 @@ async def extract_all_apps(config, all_paths):
     work_dir = config["work_dir"]
     unpack_dmg = os.path.join(os.path.dirname(__file__), "data", "unpack-diskimage")
     for counter, app in enumerate(all_paths):
+        if "macapp_entitlements" in app.formats:
+            continue;
         app.check_required_attrs(["orig_path"])
         app.parent_dir = os.path.join(work_dir, str(counter))
         rm(app.parent_dir)
@@ -560,6 +570,114 @@ async def sign_all_apps(config, key_config, entitlements_path, all_paths):
     for app in all_paths:
         futures.append(asyncio.ensure_future(verify_app_signature(key_config, app)))
     await raise_future_exceptions(futures)
+
+
+# sign_all_apps_with_map {{{1
+async def sign_all_apps_with_map(config, key_config, map_file_inner_path, all_paths):
+    """Sign all the apps using a map file.
+
+    Args:
+        config (dict): the running config
+        key_config (dict): the config for this signing key
+        map_file_inner_path (str): the path of the map file within the build artifact
+            zip file. That is, relative to the root of the unzipped zip file.
+        all_paths (list): the list of ``App`` objects
+
+    Raises:
+        IScriptError: on failure
+
+    """
+    log.info("Signing all apps using map file {}".format(map_file_inner_path))
+
+    # get the entitlements zip path
+    entitlement_zip_path = None
+    for app in all_paths:
+        if is_macapp_entitlements(app):
+            entitlement_zip_path = app.orig_path
+            break;
+    if entitlement_zip_path is None:
+        raise IScriptError("Entitlements artifact App missing from all_paths")
+
+    # remove the entitlements app entry from the all_paths list
+    signable_paths = filter_apps(all_paths, fmt="macapp_entitlements", inverted=True)
+
+    log.debug("Entitlements artifact path: {}".format(entitlement_zip_path))
+    if not os.path.exists(entitlement_zip_path):
+        raise IScriptError("Entitlements artifact {} does not exist".format(entitlement_zip_path))
+
+    # sanity check, make sure this is a valid zip file
+    if not zipfile.is_zipfile(entitlement_zip_path):
+        raise IScriptError("Codesign artifact {} is not a ZIP file".format(entitlement_zip_path))
+
+    # create a temporary directory to unzip the artifact to.
+    # this directory is automatically deleted during garbage collection
+    temp_dir = tempfile.TemporaryDirectory()
+    log.info("Unzipping {} to {}".format(entitlement_zip_path, temp_dir.name))
+
+    # unzip the file to the temporary directory
+    zf = zipfile.ZipFile(entitlement_zip_path)
+    try:
+        zf.extractall(temp_dir.name)
+    except Exception as e:
+        log.error("Error unzipping \"{}\" exception: {}".format(entitlement_zip_path, e))
+        raise IScriptError("Codesign artifact {} is not a ZIP file".format(entitlement_zip_path))
+
+    # get the full local path to the map file which must be in
+    # the codesign artifact zip file along with all entitlement
+    # files referenced from the map file.
+    map_path = "{}/{}".format(temp_dir.name, map_file_inner_path)
+    if not os.path.exists(map_path):
+        raise IScriptError("Map file {} does not exist".format(map_path))
+
+    for app in signable_paths:
+        set_app_path_and_name(app)
+
+    # sign omni.ja
+    futures = []
+    for app in signable_paths:
+        if {"autograph_omnija", "omnija"} & set(app.formats):
+            futures.append(asyncio.ensure_future(sign_omnija_with_autograph(config, key_config, app.app_path)))
+    await raise_future_exceptions(futures)
+    # sign widevine
+    futures = []
+    for app in signable_paths:
+        if {"autograph_widevine", "widevine"} & set(app.formats):
+            futures.append(asyncio.ensure_future(sign_widevine_dir(config, key_config, app.app_path)))
+    await raise_future_exceptions(futures)
+    await unlock_keychain(key_config["signing_keychain"], key_config["keychain_password"])
+    futures = []
+    # sign apps concurrently
+    for app in signable_paths:
+        futures.append(asyncio.ensure_future(sign_app_with_map(key_config, app.app_path, temp_dir.name, map_path)))
+    await raise_future_exceptions(futures)
+    # verify signatures
+    futures = []
+    for app in signable_paths:
+        futures.append(asyncio.ensure_future(verify_app_signature(key_config, app)))
+    await raise_future_exceptions(futures)
+
+
+# sign_app_with_map {{{1
+async def sign_app_with_map(key_config, app_path, artifact_dir, map_file):
+    """Sign the .app as specified in the map_file argument.
+
+    Args:
+        key_config (dict): the running config
+        app_path (str): the path to the app to be signed (extracted)
+        artifact_dir (str): the path to the unzipped codesign artifact directory
+        map_file (str): the name of the map file within the codesign artifact
+
+    Raises:
+        IScriptError: on error.
+
+    """
+    params = {
+            "sign" : key_config["identity"],
+            "keychain" : key_config["signing_keychain"]
+            }
+    if not codesigntree(map_file, app_path, artifact_dir, params, False, True, log):
+        raise IScriptError("Codesign of {} failed. Map file: {}, artifact_dir: {}".format(app_path,
+            map_file, artifact_dir))
 
 
 # get_bundle_id {{{1
@@ -997,14 +1115,12 @@ async def download_entitlements_file(config, key_config, task):
 
     Args:
         config (dict): the running configuration
+        key_config (dict): the config for this signing key
         task (dict): the running task
 
     Returns:
         str: the path to the downloaded entitlments file
         None: if not ``key_config["sign_with_entitlements"]``
-
-    Raises:
-        KeyError: if the plist doesn't include ``CFBundleIdentifier``
 
     """
     if not key_config["sign_with_entitlements"]:
@@ -1013,6 +1129,31 @@ async def download_entitlements_file(config, key_config, task):
     to = os.path.join(config["work_dir"], "browser.entitlements.txt")
     await retry_async(download_file, retry_exceptions=(DownloadError, TimeoutError), args=(url, to))
     return to
+
+
+# get_map_artifact_relative_path {{{1
+def get_map_artifact_relative_path(config, key_config, task):
+    """Get the map file path which is a relative path within the codesign artifact zip file.
+
+    Args:
+        config (dict): the running configuration
+        key_config (dict): the config for this signing key
+        task (dict): the running task
+
+    Returns:
+        str: the path of the map file within entitlements artifact zip file.
+            That is, the path relative to the root of the unzipped file.
+        None: if not ``key_config["sign_with_entitlements"]`` or if entitlements-url
+            value is not a map file (ending in .json)
+
+    """
+    if not key_config["sign_with_entitlements"]:
+        return
+    url = task["payload"]["entitlements-url"]
+    if url.endswith(".json"):
+        # remove leading slashes
+        return url.lstrip(os.sep)
+    return
 
 
 # notarize_behavior {{{1
@@ -1030,7 +1171,13 @@ async def notarize_behavior(config, task):
     work_dir = config["work_dir"]
 
     key_config = get_key_config(config, task, base_key="mac_config")
-    entitlements_path = await download_entitlements_file(config, key_config, task)
+    map_file_inner_path = get_map_artifact_relative_path(config, key_config, task)
+    entitlements_path = None
+
+    # If we don't have a map file, we'll use a single entitlements file for
+    # codesigning. Download the entitlement file now.
+    if map_file_inner_path is None:
+        entitlements_path = await download_entitlements_file(config, key_config, task)
 
     all_paths = get_app_paths(config, task)
     langpack_apps = filter_apps(all_paths, fmt="autograph_langpack")
@@ -1042,31 +1189,42 @@ async def notarize_behavior(config, task):
     await extract_all_apps(config, all_paths)
     await unlock_keychain(key_config["signing_keychain"], key_config["keychain_password"])
     await update_keychain_search_path(config, key_config["signing_keychain"])
-    await sign_all_apps(config, key_config, entitlements_path, all_paths)
+
+    if map_file_inner_path is not None:
+        # Sign using the map file in combination with the entitlements artifact
+        # identified as a "macapp_entitlements" format upstream artifact.
+        await sign_all_apps_with_map(config, key_config, map_file_inner_path, all_paths)
+    else:
+        # Sign using the downloaded entitlements file
+        apps = filter_apps(all_paths, fmt="macapp_entitlements", inverted=True)
+        await sign_all_apps(config, key_config, entitlements_path, apps)
+
+    # Remove the entitlements artifact from all_paths
+    signable_paths = filter_apps(all_paths, fmt="macapp_entitlements", inverted=True)
 
     # pkg
     # Unlock keychain again in case it's locked since previous unlock
     await unlock_keychain(key_config["signing_keychain"], key_config["keychain_password"])
     await update_keychain_search_path(config, key_config["signing_keychain"])
-    await create_pkg_files(config, key_config, all_paths)
+    await create_pkg_files(config, key_config, signable_paths)
 
     log.info("Notarizing")
     if key_config["notarize_type"] == "multi_account":
-        await create_all_notarization_zipfiles(all_paths, path_attrs=["app_path", "pkg_path"])
-        poll_uuids = await wrap_notarization_with_sudo(config, key_config, all_paths, path_attr="zip_path")
+        await create_all_notarization_zipfiles(signable_paths, path_attrs=["app_path", "pkg_path"])
+        poll_uuids = await wrap_notarization_with_sudo(config, key_config, signable_paths, path_attr="zip_path")
     else:
-        zip_path = await create_one_notarization_zipfile(work_dir, all_paths)
+        zip_path = await create_one_notarization_zipfile(work_dir, signable_paths)
         poll_uuids = await notarize_no_sudo(work_dir, key_config, zip_path)
 
     await poll_all_notarization_status(key_config, poll_uuids)
 
     # app
-    await staple_notarization(all_paths, path_attr="app_path")
-    await tar_apps(config, all_paths)
+    await staple_notarization(signable_paths, path_attr="app_path")
+    await tar_apps(config, signable_paths)
 
     # pkg
-    await staple_notarization(all_paths, path_attr="pkg_path")
-    await copy_pkgs_to_artifact_dir(config, all_paths)
+    await staple_notarization(signable_paths, path_attr="pkg_path")
+    await copy_pkgs_to_artifact_dir(config, signable_paths)
 
     log.info("Done signing and notarizing apps.")
 
@@ -1089,7 +1247,11 @@ async def notarize_1_behavior(config, task):
     work_dir = config["work_dir"]
 
     key_config = get_key_config(config, task, base_key="mac_config")
-    entitlements_path = await download_entitlements_file(config, key_config, task)
+    map_file_inner_path = get_map_artifact_relative_path(config, key_config, task)
+    entitlements_path = None
+
+    if map_file_inner_path is None:
+        entitlements_path = await download_entitlements_file(config, key_config, task)
 
     all_paths = get_app_paths(config, task)
     langpack_apps = filter_apps(all_paths, fmt="autograph_langpack")
@@ -1101,7 +1263,11 @@ async def notarize_1_behavior(config, task):
     await extract_all_apps(config, all_paths)
     await unlock_keychain(key_config["signing_keychain"], key_config["keychain_password"])
     await update_keychain_search_path(config, key_config["signing_keychain"])
-    await sign_all_apps(config, key_config, entitlements_path, all_paths)
+
+    if map_file_inner_path is not None:
+        await sign_all_apps_with_map(config, key_config, map_file_inner_path, all_paths)
+    else:
+        await sign_all_apps(config, key_config, entitlements_path, all_paths)
 
     # pkg
     # Unlock keychain again in case it's locked since previous unlock
@@ -1180,7 +1346,11 @@ async def sign_behavior(config, task):
 
     """
     key_config = get_key_config(config, task, base_key="mac_config")
-    entitlements_path = await download_entitlements_file(config, key_config, task)
+    map_file_inner_path = get_map_artifact_relative_path(config, key_config, task)
+    entitlements_path = None
+
+    if map_file_inner_path is None:
+        entitlements_path = await download_entitlements_file(config, key_config, task)
 
     all_paths = get_app_paths(config, task)
     all_paths = get_app_paths(config, task)
@@ -1191,7 +1361,12 @@ async def sign_behavior(config, task):
     await extract_all_apps(config, all_paths)
     await unlock_keychain(key_config["signing_keychain"], key_config["keychain_password"])
     await update_keychain_search_path(config, key_config["signing_keychain"])
-    await sign_all_apps(config, key_config, entitlements_path, all_paths)
+
+    if map_file_inner_path is not None:
+        await sign_all_apps_with_map(config, key_config, map_file_inner_path, all_paths)
+    else:
+        await sign_all_apps(config, key_config, entitlements_path, all_paths)
+
     await tar_apps(config, all_paths)
     log.info("Done signing apps.")
 
@@ -1209,7 +1384,11 @@ async def sign_and_pkg_behavior(config, task):
 
     """
     key_config = get_key_config(config, task, base_key="mac_config")
-    entitlements_path = await download_entitlements_file(config, key_config, task)
+    map_file_inner_path = get_map_artifact_relative_path(config, key_config, task)
+    entitlements_path = None
+
+    if map_file_inner_path is None:
+        entitlements_path = await download_entitlements_file(config, key_config, task)
 
     all_paths = get_app_paths(config, task)
     langpack_apps = filter_apps(all_paths, fmt="autograph_langpack")
@@ -1219,7 +1398,12 @@ async def sign_and_pkg_behavior(config, task):
     await extract_all_apps(config, all_paths)
     await unlock_keychain(key_config["signing_keychain"], key_config["keychain_password"])
     await update_keychain_search_path(config, key_config["signing_keychain"])
-    await sign_all_apps(config, key_config, entitlements_path, all_paths)
+
+    if map_file_inner_path is not None:
+        await sign_all_apps_with_map(config, key_config, map_file_inner_path, all_paths)
+    else:
+        await sign_all_apps(config, key_config, entitlements_path, all_paths)
+
     await tar_apps(config, all_paths)
 
     # pkg
